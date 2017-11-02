@@ -1,4 +1,22 @@
 
+<#
+.NAME
+	timeout_testscript 
+
+.SYNOPSIS
+	Test script showing how to run a background job and use a timeout
+	to prevent the job from running indefinitely. 
+
+.PARAMETER Timeout
+	By default the timeout is 30 seconds, after which time the background
+	job will self terminate or be interrupted. You can define this timeout
+	value in seconds to be any number you wish, but not more than what is 
+	needed. 
+
+.HISTORY
+	11-02-2017	Willie Lopez	Initial code and commit.
+#>
+
 param( [int32]$Timeout=30 )
 
 $d1 = get-date
