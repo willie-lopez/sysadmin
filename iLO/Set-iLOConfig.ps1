@@ -1,7 +1,7 @@
 
 <#
 .NAME
-Set-ILOConfig.ps1 
+   Set-ILOConfig.ps1 
 
 .SYNOPSIS
 	Set-iLOConfig -Domain <string> [arguments,...] 
@@ -71,7 +71,7 @@ Set-ILOConfig.ps1
 	This script does not support all versions of iLO. Changes are limited
 	to iLO3 and newer.
 	
-	Created by Willie Lopez, willie.lopez@yahoo.com 
+	Created by Willie Lopez, willie.lopez@yahoo.com, 11-02-2017
 #>
 
 
