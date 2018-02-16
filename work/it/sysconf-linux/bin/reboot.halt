@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# "at" jobs run scripts better than commands
+#
+# Willie Lopez
+
+PATH=$PATH:/usr/sbin:/sbin
+
+case $(uname) in
+  HP-UX)
+    # Ensure that host will attempt to autoboot by executing this command
+    /usr/sbin/setboot -b on
+    /usr/sbin/setboot -s on
+    /sbin/reboot -qh
+    ;;
+  Linux)
+    /sbin/halt -f
+    ;;
+  *)
+    halt
+    ;;
+esac
+
+# The reboot above should never return.
+
+exit 1
