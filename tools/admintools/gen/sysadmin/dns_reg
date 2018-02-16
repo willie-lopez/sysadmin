@@ -1,0 +1,27 @@
+#!/bin/ksh
+
+my_id_file=$HOME/.ipamsrc
+
+if [ ! -f $my_id_file ] ; then
+  ipams_id=
+  while [ -z $IPAMS_USER ]
+    do 
+      echo "Your IPAMS ID file does not exist. What is your IPAMS ID? \c"
+      read IPAMS_USER
+  done
+  echo "IPAMS_USER=$ipams_id" > $my_id_file
+else
+  . $my_id_file
+fi
+
+if [ -z "$IPAMS_USER" ] ; then
+  echo "`basename $0`: IPAMS user ID is empty"
+  exit 1
+fi
+
+if [ $# -eq 0 ] || [ "$1" = "-h" ] ; then
+  print "Usage: `basename $0` [-h] [ -f ] [ hostname ] [ ip ]"
+  exit 0
+fi
+
+

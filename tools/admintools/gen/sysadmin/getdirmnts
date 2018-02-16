@@ -1,0 +1,13 @@
+#!/usr/bin/sh
+
+PATH=/usr/sbin:/bin:/usr/bin:/etc
+host=`uname -n`
+awk -v host=$host '/vxfs/{
+	if ($2 == "/")
+	    print "/net/"host"\t\t"host":/"
+	else
+	    print "/net/"host$2"\t\t"host":"$2
+	 }' /etc/mnttab 
+
+
+

@@ -1,0 +1,324 @@
+#!/bin/sh
+
+#########################################################################
+#
+#   nfs_umount  --  unmount NFS servers from the client  (run as root)
+#
+#                   -f serverlist    - unmount these servers from client
+#                   -n nodename      - umount this server from client
+#                   -u clientlist    - unmount from these clients
+#                   -w               - run unmount as a worm
+#                   -k               - kill process binding mount point
+#                   -help            - print this usage screen
+#
+#   04/03/97 -- Willie Lopez            Initial code.
+#   04/17/02 -- Willie Lopez            Rewrote code.
+#   04/29/02 -- Willie Lopez            Add line to -HUP automounter pid.
+#   05/09/02 -- Willie Lopez            Fixed missing uplist arg bug.
+#   10/10/02 -- Willie Lopez		Fixed worm mode and added option
+#					to run qtakeback. Also changed other
+#					options back to their previous values
+#					from last revision.
+#   10/15/02 -- Willie Lopez		Fixed worm bug, tested code. 
+#   10/28/02 -- Willie Lopez		Changed flags to be -f for servers.
+#					Added use of /opt/whatsup/up to umount
+#					from when -c is not used.
+#
+#########################################################################
+
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin
+
+# Insert the revision date and revision string from repository
+rev="$Id: nfs_umount,v 1.5 2002/11/15 21:59:50 wjl Exp wjl $ 10/10/02"
+
+###########################################################################
+
+umounted=false			# Attempts were made to unmount servers
+				# If false, no verification will be done
+
+
+function print_usage
+  {
+    echo ""
+    echo "Usage: `basename $0` [args ...]"
+    echo ""
+    echo "-f or -servers file  ............ list of servers to unmount"
+    echo "-c or -clients file  ............ list of clients to unmount from"
+    echo "-S or -serverlist 's1 s2 s3' .... list of space delimited servers"
+    echo "-C or -clientlist 'c1 c2 c3' .... list of clients to unmount from"
+    echo "-a or -all ...................... umount all NFS servers from client"
+    echo "-qtakeback ...................... disable DQS/TBD and reassign jobs"
+    echo "-w or -worm ..................... run umount as a worm"
+    echo "-V or -version .................. print the revision string"
+    echo "-p or -preview .................. see what umount action will be "
+    echo "                                  taken, but don't actually run it"
+    echo "-h or -help or -? ............... print this help screen"
+    echo ""
+    echo ""
+    echo ""
+    echo "If you do not specify the -c option, then /opt/whatsup/up will be "
+    echo "used to unmount from. "
+    echo ""
+    echo ""
+    echo "Example:   "
+    echo "   This example umounts the systems listed in the file /tmp/list "
+    echo "   from all the clients listed in /opt/whatsup/up.  "
+    echo ""
+    echo "      $ nfs_umount -w -f /tmp/list  "
+    echo ""
+    echo "   This example umounts the systems listed in the file /tmp/list "
+    echo "   from the subset of clients listed in /tmp/list2."
+    echo ""
+    echo "	$ nfs_umount -w -f /tmp/list -c /tmp/list2   "
+    echo ""
+    echo "   This example umounts all NFS servers from all the clients in "
+    echo "   /opt/whatsup/up.  "
+    echo ""
+    echo "      $ nfs_umount -w -all  "
+    echo ""
+
+    exit 0
+  }
+
+function kill_procs
+  {
+    echo "Killing processes that are using $server mount points"
+    for server in $serverList ; do
+      for mnt in $(/sbin/mount -p|grep $server|awk '{print $2}'|sort -r) ; do
+	/usr/sbin/fuser -ck $mnt 
+      done
+    done
+
+    return 0
+  }
+
+function verify_umount
+  {
+    if $umount ; then
+      for server in $serverList ; do
+        if grep -q $server /etc/mnttab | grep -v autofs ; then
+	  echo "Server $server failed to umount from this client"
+        fi
+      done
+    fi
+
+    return 0
+  }
+
+function takeback
+  {
+    for qmgr in $(ps -ef | grep -e dqs -e tbd | awk '{print $4}') ; do
+      case "$qmgr" in 
+	dqs_execd)  # DQS queue manager daemon
+		echo "Stopping DQS agent and taking back jobs"
+		/usr/local/bin/qtakeback -t $hours	;;
+	tbd)        # Taskbroker 
+		echo "Stopping Taskbroker agent and taking back jobs"
+		/usr/local/bin/tb_takeback -t $hours	;;
+      esac
+    done
+
+    return 0
+  }
+
+
+
+
+###########################################################################
+# Process command line args
+###########################################################################
+
+# Default Values
+serverList=
+clientList=
+serverListFile=
+clientListFile=
+defaultClientList="/opt/whatsup/up"
+byhow="list"
+all=false
+qtakeback=false
+worm=false
+hours=1
+preview=0
+
+if [ $# -eq 0 ] ; then
+  print_usage
+fi
+
+for arg in $* ; do
+  case "$arg" in 
+    -f|-servers)	# File containing servers to unmount from clients.
+			# Mutually exclusive with -all.
+			serverListFile=$2
+			byhow="list"
+			if [ ! -f $serverListFile ] ; then
+			  echo "Can't open server list file: $serverListFile"
+			  exit 1
+			else
+			  serverList="$(cat $serverListFile)"
+			fi
+			shift 2  
+			;;
+
+    -c|-clients)	# File containing clients to umount servers from
+			clientListFile=$2
+			if [ ! -f $clientListFile ] ; then
+			  echo "Can't open client list file: $clientListFile"
+			  exit 1
+			else 
+			  clientList=$(cat $clientListFile)
+			fi
+			shift 2
+			;;
+
+    -S|-serverlist)	# List of servers to unmount from clients
+			serverList=$2
+			byhow="list"
+			shift 2  
+			;;
+
+    -C|-clientlist)	# List of clients to umount servers from
+			clientList=$2
+			shift 2 
+			;;
+
+    -a|-all)		# Flag indicating unmounting all NFS mounts
+			# Mutually exclusive with -serverlist/-servers.
+			all=true
+			byhow="all"
+			shift
+			;;
+
+    -qtakeback)		# Disable DQS queue and kill jobs
+			qtakeback=true
+			shift
+			;;
+
+    -w|-worm)		# Run this as a worm across client list
+			worm=true
+			shift
+			;;
+
+    -V|-version)	echo "$rev"
+			exit 0
+			;;
+
+    -p|-preview)	preview=true
+			shift
+			;;
+
+    -h|-help|-?)	# Print usage
+			print_usage
+			exit 0
+			;;
+  esac
+done
+
+
+#  Make sure we have the right args
+
+if [ $worm = true -a -z "$clientList" ] ; then
+  echo "Will unmount from clients listed in $defaultClientList"
+
+  if [ ! -f $defaultClientList ] ; then
+    echo "Can't find the default client list at $defaultClientList"
+    exit 1
+  fi
+
+  clientList="$(cat $defaultClientList)"
+fi
+
+if [ "$byhow" = "list" -a -z "$serverList" ] ; then
+  echo "Must specify a server list use the option -all"
+  print_usage
+fi
+
+
+
+
+###########################################################################
+# Leave now if this host is not an NFS client
+###########################################################################
+
+if ps -ef | grep -q -e automount -e amd >/dev/null 2>&1 ; then
+  :	# The automounter is running, which means we can continue
+else
+  echo "This host is not an NFS client"
+  exit 0
+fi
+
+
+###########################################################################
+# Do the unmounts now
+###########################################################################
+
+if $qtakeback ; then
+  takeback $hours
+fi
+
+if [ $worm = true ] ; then
+
+  if [ -z "$serverList" ] ; then
+    run_args="-all"
+  else
+    run_args="-serverlist \"$serverList\""
+  fi
+
+  if [ $qtakeback = true ] ; then
+    run_args="$run_args -qtakeback"
+  fi
+
+  # Run this nfs_umount command across the client list now.
+  /usr/local/bin/rpush -l admin --hostlist="$clientList" \
+	"/admin/bin/nfs_umount $run_args"
+
+fi
+
+myname=$(/usr/bin/hostname)
+
+# If preview mode is set, then don't actually run the
+# command, just show what it would do (excluding the actual
+# umount [args...].  Show only the call to nfs_umount.
+
+if [ $preview = true ] ; then
+  echo "`basename $0` $*"
+  exit 0
+fi
+
+case "$byhow" in 
+  all)		# Unmount all NFS servers listed in /etc/mnttab
+		echo "Trying to umount all NFS servers listed in /etc/mnttab"
+		kill_procs $serverList
+		/sbin/umount -v -a -F nfs
+		umounted=true
+		;;
+
+  list)		# Umount only the NFS servers in the serverList
+		for server in $serverList ; do
+		  if host $server >/dev/null 2>&1 ; then
+		    if /usr/sbin/ping $server 8 1 >/dev/null 2>&1 ; then
+		      :		# Up and probably will unmount
+		    else
+		      # Unreachable, probably won't umount
+		      echo "${myname}: $server is unreachable, trying to umount anyway"
+		    fi
+
+		    if /sbin/mount -p | grep -q $server >/dev/null 2>&1 ; then
+		      kill_procs $serverList
+		      /sbin/umount -v -h $server -a 
+		      umounted=true
+		    else
+		      echo "${myname}: Server $server is not NFS mounted"
+		    fi
+		  else
+		    echo "${myname}: Server $server is an invalid hostname"
+		  fi
+		done
+		;;
+esac
+
+verify_umount $serverList
+
+exit 0
+

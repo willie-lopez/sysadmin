@@ -1,0 +1,51 @@
+#!/bin/sh
+
+##########################################################################
+#
+#   Name:
+#       netdir_clean - cleans out invalid directory names from /net
+#
+#   Syntax:
+#       As root ...
+#
+#       netdir_clean
+#
+#   Description:
+#       netdir_clean removes invalid directories from the /net
+#       directory.  Directories in /net are presumed to be hostnames.
+#       A directory is considered to be invalid if it cannot be
+#       resolved by a gethostbynam(3N).  The directory name alone
+#       used as a hostname will assume the default internet domain
+#       in the gethostbynam(3N).  Though the hostname may really
+#       exist in a different domain, it is still considered invalid
+#       if in the current domain that hostname does not exist in
+#       DNS.
+#
+#   Returns:
+#       Nothing
+#
+#   Notes:
+#       If the /net/<hostname> has subdirectories in it, those sub
+#	directories are unmounted.  The entire /net/<host> directory
+#	is then removed.
+#
+#   History:
+#       08-27-2002      Willie Lopez            Initial creation.
+#
+##########################################################################
+
+for netdir in `/bin/ls /net` ; do
+        if /usr/bin/host $netdir >/dev/null 2>&1 ; then
+                continue
+        fi
+        echo "Host $netdir does not exist in current domain ... removing it"
+        for mnt in `grep $netdir /etc/mnttab | awk '{print $2}'` ; do
+                if [ -d $mnt ] ; then
+                        /usr/bin/umount $mnt
+                fi
+        done
+        /usr/bin/rm -rf /net/$netdir
+done
+
+exit 0
+
