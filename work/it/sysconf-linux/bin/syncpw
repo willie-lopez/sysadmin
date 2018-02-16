@@ -1,0 +1,134 @@
+#!/bin/sh
+#
+# (c) Copyright 2003, 2004, 2005 Hewlett-Packard Development Company, L.P.
+#
+# syncpw - developed by Willie Lopez on 09/02/2003
+# Causes local user passwd entry to sync with NIS passwd entry
+# State: beta
+
+USERLIST=$1
+
+###########################################################################
+#  Clean up and exit on any signal
+trap 'rm -f /tmp/*.$$ /etc/ptmp;exit 0' 0
+
+###########################################################################
+#  Set logging tag to be the script name
+tag=$(basename $0)
+
+###########################################################################
+#  Prequalification tests
+
+if [ -z "$USERLIST" ] ; then
+  echo "Usage: `basename $0` user"
+  exit 0
+fi
+
+if ! ps -ef | grep -v grep | grep -q ypbind ; then
+  echo "Host is not an NIS client, exiting"
+  logger -t $tag "Host is not an NIS client, exiting"
+  exit 0
+fi
+
+updatepw()
+  {
+    userid=$1
+    passwd=$2
+
+    if [ -z "$userid" ] || [ -z "$passwd" ] ; then
+      echo "NULL values cannot be passed into update(), exiting!"
+      logger -t $tag "NULL values cannot be passed into update(), exiting!"
+      return 1
+    fi
+
+    if ! grep -q "^$userid:" /etc/passwd ; then
+      echo "User $userid is not in /etc/passwd"
+      logger -t $tag "User $userid is not in /etc/passwd"
+      return 0
+    fi
+
+    awk -F: -v userid=$userid -v passwd=$passwd 'BEGIN{chgflag=0}{
+
+		    lognm=$1
+		    pw=$2
+		    uid=$3
+		    gid=$4
+		    gecos=$5
+		    home=$6
+		    shell=$7
+
+		    if (userid == lognm)
+		      {
+			printf "%s:%s:%s:%s:%s:%s:%s\n",
+			    lognm,passwd,uid,gid,gecos,home,shell
+		        chgflag=1
+		      }
+		    else
+			printf "%s:%s:%s:%s:%s:%s:%s\n",
+			    lognm,pw,uid,gid,gecos,home,shell
+
+		}END{exit chgflag}' /etc/passwd >> /tmp/passwd.$$
+
+    if [ $? -eq 1 ] ; then
+      echo "User $userid passwd updated in /etc/passwd file"
+      logger -t $tag "User $userid passwd updated in /etc/passwd file"
+    fi
+
+    return
+  }
+
+#############################################################################
+#############################################################################
+
+#  Make sure the passwd file is not locked
+if [ -f /etc/ptmp ] ; then
+  echo "/etc/passwd file is already locked, try later!"
+  logger -t $tag "/etc/passwd file is already locked, try later!"
+  exit 1
+fi
+
+#  Make sure we have root privilages
+if [ $(id -u) -ne 0 ] ; then
+  echo "Must be root to run `basename $0`"
+  logger -t $tag "Must be root to run `basename $0`"
+  exit 0
+fi
+
+#  Now lock the passwd file
+touch /etc/ptmp
+
+for user in $USERLIST ; do
+  userid=$(basename $user)
+  if grep -q "^$userid:" /etc/passwd ; then
+    pwline=$(grep "^$userid:" /etc/passwd)
+    uid=$(echo $pwline | awk -F: '{print $3}')
+    if [ $uid -lt 1000 ] ; then
+      echo "Can't sync a root privileged user, bailing!!"
+      logger -t $tag "Can't sync a root privilaged user ($uid)"
+      exit 1
+    fi
+  fi
+  pw=$(ypmatch $userid passwd | awk -F: '{print$2}')
+  if grep -q "^$userid:" /etc/passwd ; then
+    localpw=$(grep "^$userid:" /etc/passwd | awk -F: '{print$2}')
+    if [ "$pw" != "$localpw" ] ; then
+      updatepw $userid $pw
+    fi
+  fi
+done
+
+if [ -f /tmp/passwd.$$ ] ; then
+  bytes1=$(cksum /etc/passwd | awk '{print$1}')
+  bytes2=$(cksum /tmp/passwd.$$ | awk '{print$1}')
+fi
+
+if [ "$bytes1" != "$bytes2" ] ; then
+  echo "Updating /etc/passwd file"
+  logger -t $tag "Updating /etc/passwd file"
+  mv /tmp/passwd.$$ /etc/passwd
+else
+  echo "No changes were made to /etc/passwd file."
+  logger -t $tag "No changes were made to /etc/passwd file."
+fi
+
+exit 0
