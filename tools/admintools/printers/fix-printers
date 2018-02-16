@@ -1,0 +1,205 @@
+#!/bin/sh
+
+#$Id: fix-printers,v 1.2 2003/02/19 00:14:42 wjl Exp wjl $
+
+
+PATH=/usr/sbin:/usr/bin:/usr/lib
+
+# If this file exists, these printers will be setup rather
+# than the printers defined in the master printers.info file.
+local='/usr/local/printers/printers.info' 
+
+# This file is the master list of all printers in VTC.  It
+# is used for setting up printers by default.  A local 
+# config file will override this file.
+master='/net/fmlatlas/mnt/nfsusers/janitor/printers/printers.info'
+
+# Do not use the master printers list file.  When this is set to 0,
+# the $local printers list file will be used first if it is present.
+force_masterlist=0
+
+###########################################################################
+
+if [ `id -u` -ne 0 ] ; then
+    echo "$0 Must be run as root!"
+    exit 1
+fi
+
+
+###########################################################################
+###########################################################################
+
+# Stop the LP spooler
+function lp_stop
+  {
+    echo "Stopping LP scheduler"
+
+    lpshut >/dev/null 2>&1
+    return
+  }
+
+# Start the LP spooler
+function lp_start
+  {
+    echo "Starting LP spooler"
+
+    lpsched 
+    return
+  }
+
+
+# Check the LP spooler status.  Return 0=not running, 1=running
+function lp_status
+  {
+    status=1
+
+    if [ "`lpstat -r`" = "scheduler not running" ] ; then
+	status=0
+    fi
+
+    return $status
+  }
+
+
+# Remove a printer
+function lp_remove
+  {
+    if [ $# -ne 1 ] ; then
+	echo "lp_remove: no printer name given, nothing done"
+	exit 1
+    fi
+
+    printer=$1		# Remove this printer
+
+    echo "Removing printer $printer"
+    lpadmin -x$printer
+
+    return
+  }
+
+# Add printer
+function lp_add
+  {
+    if [ $# -ne 3 ] ; then
+	echo "lp_add: must specify a printer alias, server, and name!"
+	exit 1
+    fi
+
+    palias=$1		# Printer's local name (the alias)
+    pserver=$2		# Printer's server
+    pname=$3		# Printer's real name
+
+    echo "Setting up printer $pname as $palias"
+
+    lpadmin -p${palias} -mrmodel -ocmrcmodel -osmrsmodel \
+	    -orm${pserver} -orp${pname} -v/dev/null;
+	
+    accept ${palias}
+    enable ${palias}
+
+    return
+  }
+
+
+############################################################################
+############################################################################
+
+# Make sure we are not on a printer server
+case `uname -n` in
+fml-prn1|mtlprn|mtl-prn1|mtl-prn2)
+	echo "$0 does not need to run on a print server."
+	exit 1
+	;;
+esac
+
+# Get command line args
+if [ $# -gt 0 ] ; then
+    while [ $# -gt 0 ] ; do
+	case "$1" in 
+	-m)  # Use master printers info file
+	     force_masterlist=1
+	     echo "$0: force masterlist set, using master printer list!"
+	     shift
+	     ;;
+        *)   echo "Usage: $0 [-m]"
+	     echo "-m forces the use of the master printers info file"
+	     exit 0
+	     ;;
+        esac
+    done
+fi
+
+
+# Copy the default printer 
+if [ -f /usr/spool/lp/default ] ; then
+    cp /usr/spool/lp/default /usr/spool/lp/default~
+fi
+
+# Attempt to stop LP services.  If it fails after 3 trys, 
+# then something is wrong that needs attention.
+for try in 1 2 3 ; do
+    lp_stop
+    lp_status
+    if [ $? -eq 0 ] ; then
+    	echo "The LP spooler is running; trying again!"
+    else
+	break
+    fi
+done
+
+
+# Remove all printers currently setup.
+for P in `ls /usr/spool/lp/request` ; do
+    echo "Attempting to cancel jobs for printer $P"
+    #cancel -e $P  # removed by wjl 9/11/98
+    lp_remove $P
+done
+
+
+# Reinstall all printers.  
+if [ ! -f $local -o $force_masterlist -eq 1 ] ; then
+    echo "Installing printers from $master"
+    configfile=$master
+    while read palias pserver pname ptype plang pduplex pcolor ppost pclass
+      do
+	if [ "^$palias" = "#" ] ; then
+	    continue
+	fi
+	lp_add $palias $pserver $pname
+	plist="$plist $palias"
+      done < $configfile
+else
+    echo "Installing printers from $local"
+    configfile=$local
+    while read palias pserver pname
+      do
+	if [ "^$palias" = "#" ] ; then
+	    continue
+	fi
+	lp_add $palias $pserver $pname
+	plist="$plist $palias"
+      done < $configfile
+fi
+
+# Reinstall the printer default
+if [ -f /usr/spool/lp/default~ ] ; then
+    def=`cat /usr/spool/lp/default~`
+    if [ "$def" != "" ] ; then
+    	/usr/local/bin/lps | grep -i $def >/dev/null 2>&1
+	if [ $? -eq 0 ] ; then
+	    cp /usr/spool/lp/default~ /usr/spool/lp/default
+	else
+	    echo "Printer $def is not a printer on `uname -n`"
+	fi
+    fi
+fi
+
+
+# Restart the LP spooler
+lp_start
+
+
+###########################################################################
+#  MAIN
+###########################################################################
+
