@@ -1,0 +1,1162 @@
+#!/usr/bin/perl5 
+
+###########################################################################
+#
+#   Name:
+#       whatsup - checks up/down status of machines
+#
+#   Syntax:
+#       whatsup [-f test-list]
+#
+#   Description:
+#       Whatsup tests the up/down status of the list of machines 
+#       $machList.  A machine is up if a connection to the timed
+#       port was made within $timeout seconds.  Down machines are
+#       logged to the file $downLog, and UP machines are logged
+#       to the file $upLog.  The persons listed in the table
+#       PageMe are notified of the first $pageLimit down machines
+#       to avoid unnecessary paging when several machines go down.
+#       Machines that are also in the $exclude file are ignored.
+# 
+#   History:
+#       12-03-97    Willie Lopez            Original code
+#       12-26-97    Willie Lopez            Modified to run more effeciently;
+#                                           send mail/page only when list 
+#                                           changes.
+#       01-07-98    Willie Lopez            Changed down message to !system
+#       01-13-98    Willie Lopez            Changed up log to use $upLog
+#       01-20-98    Willie Lopez            Changed page_me to send one page
+#                                           with a list of down machines
+#
+#	10-31-99    Willie Lopez	    Added signal handler to cleanup
+#					    if a signal is caught, exect KILL.
+#
+#	11-19-1999  Willie Lopez	    Added test code to send a message
+#					    if whatsup is already running. The
+#					    receipiant of the msg will be chngd
+#					    to a user named in var after tests.
+#
+#	11-21-1999  Willie Lopez	    Fixed down logging problem where
+#					    down counter was not incrementing.
+#
+#	12-15-1999  Willie Lopez	    Changed close of socket from 
+#					    close(SOCKET) to close(SOCK) since
+#					    discriptor is SOCK and not SOCKET.
+#
+#	12-28-1999  Willie Lopez	    Modified code to make it portable
+#					    and usable in any env.
+#
+#	12-29-1999  Tim Cottam		    Fixed count_db() to return
+#					    $#keyset+1 instead of $#keyset.
+#
+#	12-31-1999  Willie Lopez	    Changed WEBPATH in runConfig to
+#					    WWWPATH; it was a mismatch between
+#					    defaults and get_args.
+#
+#	01-13-2000  Willie Lopez	    Fixed problem with writing out
+#					    excluded systems in down list
+#					    and on state page.
+#
+#					    Also added notify.pl call, now a
+#					    required function, completely
+#					    customized and written by the
+#					    user.
+#
+#	02-24-2000  Willie Lopez	    Added datestamp to print msg
+#					    for first scan. 
+#
+#	03-02-2000  Willie Lopez	    Fixed return value in count_db
+#					    to return $#array + 1.
+#
+#	10-26-2000  Willie Lopez	    Added code to look for an
+#					    ready running whatsup process
+#					    and exit if found.
+#
+#	01-03-2001  Willie Lopez	    Added back in verbose mode.
+#                                           Added signal handler for HUP and
+#                                           help for ALRM.
+#
+#	01-08-2001  Willie Lopez	    Added timestamp to print stmt
+#					    check to see if whatsup is  
+#					    already running. Also changed
+#					    the exit code to 1 as an error.
+#
+#	02-26-2001  Willie Lopez	    Added check in log_down to 
+#					    check if the down node is in 
+#					    the machStat table, and to skip
+#					    logging the node down if not.
+#					    This will eliminate useless 
+#					    paging when nodes have been
+#					    removed from the node_lists.
+#
+############################################################################
+
+use Socket;
+use Getopt::Long;
+use Time::localtime;
+use strict;
+
+require '/opt/whatsup/notify.pl';
+
+
+############################################################################
+############################################################################
+
+# Setup default run configuration
+my %runConfig = ();
+
+$runConfig{'NTP_SERVER'} = "ntp-3f";
+$runConfig{'NODE_LIST'}  = "/opt/whatsup/node_list";
+$runConfig{'EXCLUDE'}	 = "/opt/whatsup/exclude";
+$runConfig{'LOGFILE'}	 = "/var/adm/whatsup.log";
+$runConfig{'UPLOG'}      = "/opt/whatsup/up";
+$runConfig{'DOWNLOG'}    = "/opt/whatsup/down";
+$runConfig{'WWWPATH'}	 = "/usr/local/apache/htdocs";
+$runConfig{'TIMEOUT1'}   = 3;
+$runConfig{'TIMEOUT2'}   = 5;
+$runConfig{'SCANIDLE'}	 = 600;
+$runConfig{'SCREENLOG'}  = "OFF";
+$runConfig{'DAEMON'}	 = 0;
+$runConfig{'IDLETIME'}	 = 180;
+$runConfig{'VERBOSE'}	 = 0; 
+
+
+
+############################################################################
+#   Check for already running whatsup session, exit if found.
+
+my $old_proc = do_getpid("whatsup");
+if ( $$ != $old_proc )
+  {
+    print STDOUT "\nAnother whatsup process ($old_proc) is running at ",
+	get_timestamp(),"\n";
+    exit(1);
+  }
+
+
+
+
+############################################################################
+
+# Get any command line arguments.  These values will override defaults.
+
+get_args (%runConfig);
+
+my $verbose = $runConfig{'VERBOSE'};
+my $testing_host = "<empty>";
+
+
+
+############################################################################
+
+
+#  Set global machine status flag to 0, host is available
+my $downflag = 0;
+my $status = 0;
+my $host = "";
+my $node = "";
+
+
+#  Set default status flags
+my $UP 		= 0;			# Node is up and functioning 
+my $DOWN 	= 1;			# Node is unreachable
+my $EXCLUDED 	= 2;			# Node excluded and not tested
+my $TIME_SYNC	= 3;			# Time not in sync with NTP server
+my $NOT_FUNC	= 4;			# Node is UP but not functioning
+
+
+# Default table where node status is stored
+my %machStat;
+
+
+#  Set timeout function, sets host status flag to 1 if called
+#  The node is not responding if this handler is called.
+$SIG{'ALRM'} = sub {
+    $downflag = 1;
+    $status = 1;
+    $machStat{$host} = $downflag;
+  };
+
+$SIG{'HUP'} = \&sig_hup;
+
+
+
+
+############################################################################
+############################################################################
+
+
+# Get current list of down machines.  The data contains the name of
+# the host that was down during the last scan and the consecutive number
+# of times the host was down. This count is necessary for notification
+# and determining total time down.
+
+my %downList = get_downdb (%runConfig);
+
+
+# Get current list of nodes to exclude from the test.  This data contains
+# only the names of the hosts to exclude.
+
+my %ignoreList = get_excludedb (%runConfig);
+
+
+# Get list of nodes to test.  This data contains only the hostname.
+
+my %machStat = get_nodedb (%runConfig);
+
+
+# Delete any nodes that are excluded
+foreach $node (keys(%machStat))
+  {
+    delete $machStat{$node}
+    	if ($ignoreList{$node});
+  }
+
+
+
+############################################################################
+############################################################################
+
+
+
+FIRSTSCAN:
+#  Get the time from the default time server for drift comparison.
+#  If the status or downflag is non-zero, then use the localtime 
+#  taken from the server whatsup is running on.
+
+my $ntpTime = get_status ($runConfig{'NTP_SERVER'},$runConfig{'TIMEOUT1'});
+$ntpTime = localtime(time) 
+    if ($status != 0 || $downflag != 0);
+
+
+
+#  Perform first test 
+
+print STDOUT "\nFirst scan for down nodes at ",get_timestamp(),": ";
+print STDOUT "\n\tTotal nodes to test ............ ", count_db(%machStat); 
+print STDOUT "\n\tNodes excluded from test ....... ", count_db(%ignoreList);
+print STDOUT "\n\tNodes down in last scan ........ ", count_db(%downList);
+print STDOUT "\n\n";
+
+my $client_time = 0;
+my $first_timeout = $runConfig{'TIMEOUT1'};
+my $drift = 0;
+
+foreach $host (sort(keys(%machStat)))
+  {
+    next if ( $ignoreList{$host});
+
+    ### TEST ### 
+    $ntpTime = get_status ($runConfig{'NTP_SERVER'},$runConfig{'TIMEOUT1'});
+     
+    $testing_host = $host;
+
+    # Print hostname in verbose mode
+    printf ("\nTesting host %s ... ",$host) if ( $verbose );
+
+    # Reset downflag to UP
+    $downflag = $status = $UP;
+
+    # Reset status and client time
+    $status = 0;
+    $client_time = 0;
+    $drift = 0;
+
+    # Get status of host
+    ($status,$client_time) = &get_status ($host,$first_timeout);
+
+
+    # Catch any timeout. These nodes are unreachable.
+    $status = $DOWN 
+	if ( $downflag == $DOWN );
+
+    # Calculate time drift
+    $drift = ($client_time > 0) ? ($client_time - $ntpTime) : 0;
+
+    if ( $status == $DOWN )
+      {
+    	$machStat{$host} = [ $DOWN, 0, 0 ];
+    	print "\t",$host," is DOWN\n"; 
+      }
+    elsif ( $status == $NOT_FUNC )
+      {
+	# Host was responding but not functioning
+	$machStat{$host} = [ $NOT_FUNC, 0, 0 ];
+      }
+    else
+      {
+	# If time is more than 10 min wrong, set status to TIME_SYNC.
+	# Affects only systems that are up and reachable
+	$status = ($drift < -180 || $drift > 180) ? $TIME_SYNC : $UP;
+    	$machStat{$host} = [ $status, $client_time, $drift ];
+      }
+
+    # Delete the host from the downList if it is not down
+    delete $downList{$host} if ( $status != $DOWN );
+  }
+
+
+VERIFY:
+
+#  Rescan those hosts found to be down
+
+print "\nRescanning those nodes found down during first scan ... \n";
+my $verify_timeout = $runConfig{'TIMEOUT2'};
+
+foreach $host (keys(%machStat))
+  {
+    # Skip UP hosts
+    next if ($machStat{$host}[0] != $DOWN); 
+
+    # Print hostname in verbose mode
+    printf ("\nRetesting host %s ... ",$host) if ( $verbose );
+
+    # Reset status and client time
+    $status = 0;
+    $client_time = 0;
+    $drift = 0;
+
+    ($status,$client_time) = &get_status ($host,$verify_timeout);
+
+    $status = $DOWN if ( $downflag == $DOWN );
+    my $drift = ($client_time > 0) ? ($ntpTime - $client_time) : 0;
+    
+    # Set host status to UP if node available/functioning
+    $machStat{$host} = [ $UP, $client_time, $drift ]
+	if ( $downflag == $UP );
+    
+    # Update the downlist table
+    if ( $downflag == $DOWN )
+      {
+	print "\t",$host," verified DOWN\n";
+    	$downList{$host} = $downList{$host} + 1;
+      }
+  }
+
+
+#  Log host status
+&log_down ($runConfig{'DOWNLOG'},$runConfig{'WWWPATH'},%downList);
+&log_up ($runConfig{'UPLOG'},%machStat);
+&log_state ($runConfig{'WWWPATH'},$ntpTime,%machStat);
+
+&print_nodedb (%machStat)
+    if ( $runConfig{'SCREENLOG'} eq "YES" ); 
+
+
+#  Restart if running in daemon mode
+if ( $runConfig{'DAEMON'} == 1 )
+  {
+    # Set idle time to 60 seconds if set lower
+    $runConfig{'IDLETIME'} = 60 if ($runConfig{'IDLETIME'} < 60);
+    print STDOUT "\nIn daemon mode, waiting $runConfig{'IDLETIME'} seconds";
+    sleep ($runConfig{'IDLETIME'});
+    goto FIRSTSCAN;
+  }
+
+
+#  Notify contacts with down list
+notify(%downList);
+
+
+#  Close this session
+clean_exit ();
+
+exit;
+
+
+#########################################################################
+#########################################################################
+
+sub print_config
+  {
+    my	%config	    = @_;
+    my	$parm	    = "";
+
+    print STDOUT "\nThe following run time configuration will be used:\n";
+
+    foreach $parm (sort(keys %config))
+      {
+	if ( $parm eq "TIMEOUT1" )
+	  {
+	    printf STDOUT "\n%12s = %s seconds","FIRST-TRY",$config{$parm};
+	  }
+	elsif ( $parm eq "TIMEOUT2" )
+	  {
+	    printf STDOUT "\n%12s = %s seconds","VERIFY-TRY",$config{$parm};
+	  }
+	else
+	  {
+	    printf STDOUT "\n%12s = %s",$parm,$config{$parm};
+	  }
+      }
+
+    printf STDOUT "\n";
+    print STDOUT "\nFIRST-TRY & VERIFY-TRY indicate how long a node has";
+    print STDOUT "\nto respond to the connection before the node is";
+    print STDOUT "\nconsidered down.\n";
+
+    return;
+  }
+
+
+sub get_args
+  {
+    my	($machList) = "";
+    my	$showconf = 0;
+    my	($machList,$ntp_server,$exclude_list,$log_file,$help,$screen) = "";
+    my	($up_log,$down_log,$first_timeout,$verify_timeout,$showconf) = "";
+    my	($webpath) = "";
+    my  ($daemon,$verbose_on) = 0;
+    my	($daemon_sleep) = 180;
+
+    $Getopt::Long::bundling = 1;
+    $Getopt::Long::order = $REQUIRE_ORDER;
+
+    my %longopts = ("f=s"           => \$machList,
+		    "ntp=s"	    => \$ntp_server,
+		    "e=s"	    => \$exclude_list,
+		    "log=s"	    => \$log_file,
+		    "up=s"	    => \$up_log,
+		    "down=s"	    => \$down_log,
+		    "timeout1=s"    => \$first_timeout,
+		    "timeout2"	    => \$verify_timeout,
+		    "showconf"	    => \$showconf,
+		    "screen"	    => \$screen,
+		    "webpath=s"	    => \$webpath,
+		    "d"	    	    => \$daemon,
+		    "sleep=s"	    => \$daemon_sleep,
+		    "v"		    => \$verbose_on,
+		    "help"
+		    );
+
+    if (!&GetOptions (%longopts))
+      {
+	      warn "\n$0: invalid command line argument\n";
+	      print_help();
+      }
+
+    print_help() if ( $help );
+
+    if ( $showconf )
+      {
+	print STDOUT "\nThe default configuration is: \n";
+	print_config (%runConfig);
+	exit(0);
+      }
+
+    $runConfig{'NTP_SERVER'} = $ntp_server if ($ntp_server);
+    $runConfig{'NODE_LIST'}  = $machList if ($machList);
+    $runConfig{'EXCLUDE'}    = $exclude_list if ($exclude_list);
+    $runConfig{'LOGFILE'}    = $log_file if ($log_file);
+    $runConfig{'UPLOG'}      = $up_log if ($up_log);
+    $runConfig{'DOWNLOG'}    = $down_log if ($down_log);
+    $runConfig{'TIMEOUT1'}   = $first_timeout if ($first_timeout);
+    $runConfig{'TIMEOUT2'}   = $verify_timeout if ($verify_timeout);
+    $runConfig{'SCREENLOG'}  = "YES" if ($screen);
+    $runConfig{'WWWPATH'}    = $webpath if ($webpath);
+    $runConfig{'DAEMON'}     = 1 if ($daemon);
+    $runConfig{'IDLETIME'}   = $daemon_sleep if ($daemon_sleep > 0);
+    $runConfig{'VERBOSE'}    = 1 if ($verbose_on);
+
+    return;
+  }
+
+sub print_help
+  {
+    print STDOUT "\nUsage: $0 [ args ]\n";
+    print STDOUT "\n--f file        - file containing systems to check";
+    print STDOUT "\n--ntp sysnam    - name of NTP host to use for comparison";
+    print STDOUT "\n--e file        - file with names of host to exclude";
+    print STDOUT "\n--log file      - name of file to log output";
+    print STDOUT "\n--up file       - name of file to write UP list";
+    print STDOUT "\n--down file     - name of file to write DOWN list";
+    print STDOUT "\n--timeout1 sec  - number of seconds for first timeout";
+    print STDOUT "\n--timeout2 sec  - number of seconds for verify timeout";
+    print STDOUT "\n--showconf      - show default run time configuration";
+    print STDOUT "\n--webpath dir  - path of htdocs directory";
+    print STDOUT "\n-help          - print this help screen";
+
+    print STDOUT "\n\n";
+    print STDOUT "\nScan list of nodes for down machines.  Testing whether a ";
+    print STDOUT "\nnode is UP or DOWN is done by connecting to the time port";
+    print STDOUT "\nand reading the time.  If the machine does not respond";
+    print STDOUT "\nwithin 3 seconds by default, then the node is retested. If";
+    print STDOUT "\nthe node fails to respond within 5 seconds during the ";
+    print STDOUT "\nsecond scan, then the node is marked DOWN.";
+    print STDOUT "\n";
+    print STDOUT "\nAny arguments that are given on the command line will ";
+    print STDOUT "\noverwrite the default values.\n";
+
+
+    print_sighandler();
+
+    print STDOUT "\nThe average time for this script to run is about 1/10 sec";
+    print STDOUT "\nper node.  A list of 900 nodes should only take about";
+    print STDOUT "\n1 to 2 minutes to run completely.  The run time is based";
+    print STDOUT "\non a well running network.  Any networking problems will";
+    print STDOUT "\ncause the whatsup run time to increase significantly!\n";
+    print STDOUT "\n";
+
+    exit(0);
+  }
+
+sub print_sighandler
+  {
+    print STDOUT "\nHandling of SIGNALs send with kill to the whatsup PID:\n";
+    print STDOUT "\n  kill -HUP   aborts test on current node and prints node";
+    print STDOUT "\n              to the screen.  The host is marked UP";
+    print STDOUT "\n  kill -ALRM  aborts test on current node but marks node";
+    print STDOUT "\n              down and does not print abort msg on screen.";
+    print STDOUT "\n              Most useful when used with --v (verbose)";
+    print STDOUT "\n  kill -KILL  terminates whatsup, nothing will be logged.";
+    print STDOUT "\n              Prints abort msg on screen.";
+    print STDOUT "\n";
+
+    return;
+  }
+
+sub get_downdb
+  {
+    my	%config     = @_;
+    my  $downLog    = $config{'DOWNLOG'};
+    my	$down_host  = "";
+    my	$down_count = 0;
+    my	%downdb     = ();
+
+    open (DOWN,"<$downLog") or warn "\nNo former down host list";
+    while (<DOWN>)
+      {
+    	chop ($_);
+	($down_host,$down_count) = split (/\s+/,$_);
+	$downdb{$down_host} = $down_count;
+      }
+
+    close (DOWN);
+
+    return (%downdb);
+  }
+
+
+sub get_excludedb
+  {
+    my	%config	    = @_;
+    my	%excludedb  = ();
+    my	$excludeList = $config{'EXCLUDE'};
+
+    open (EXCLUDE,"<$excludeList") or 
+	warn "\nNo hosts excluded for up/down test";
+    while (<EXCLUDE>) 
+      { 
+	chop ($_); 
+	$excludedb{$_} = 1; 
+      }
+
+    close (EXCLUDE);
+
+    return (%excludedb);
+  }
+
+
+sub get_nodedb
+  {
+    my	%config	    = @_;
+    my	$machList   = $config{'NODE_LIST'};
+    my	%nodedb	    = ();
+
+    open (MACHLIST,"<$machList") or
+    	die "\nCannot open test host list $machList";
+
+    while (<MACHLIST>)
+      {
+    	chop ($_);
+    	$nodedb{$_} = [ $UP, 0, 0 ] 
+	    if ( !defined($nodedb{$_}) );
+      }
+
+    close(MACHLIST);
+    
+    return (%nodedb);
+  }
+
+
+sub count_db
+  {
+    my	%db	= @_;
+
+    my @keyset = keys %db;
+    my $count = $#keyset; 
+
+    return ($count+1);
+  }
+
+
+#
+#   Name:
+#	get_status - get the current status of a node  
+#
+#   Synopsis:
+#	($status, $local_time) = get_status ($nodename,$timeout_val)
+#
+#	$nodename     - name of the node to test
+#	$timeout_val  - timeout value for which to trap if 
+#			cannot connect to node 
+#
+#   Description:
+#	This function tests whether node $nodename is up or down
+#	by reading the time from its TIME services port.  Connectivity
+#	must be made within $timeout_val seconds, or the node is 
+#	considered down or unreachable.  In either case, the node needs
+#	attention.
+#
+#   Returns:
+#	Two values are returned upon success of the function:
+#	status (UP or DOWN) and the node's localtime.
+#
+#	Upon success, [ 0, localtime() ] are returned
+#	Otherwise, [ 1, 0 ] are returned
+#
+#	If a node is unreachable, the timeout is trapped and the
+#	signal handler is called and the status is set to 1 for
+#	down and the time is set to 0.  The only failure mode 
+#	within this function is "connection refused."  In that 
+#	case, down (1) is returned and localtime() = 0.
+#
+#   History:
+#	12-27-1999  Willie Lopez		Documented
+#
+
+sub get_status
+  {
+    my ($client) = shift;	# Get name of client to test
+    my ($timeout) = shift;	# Get timeout threshold value
+    my ($status) = 0;           # System status flag
+    my ($sockStruct); 
+    my ($bytesRead) = 0;
+    my ($timeStamp) = 0;
+    my $delta  = 2208988800;
+    
+
+    my ($proto) = getprotobyname ('tcp') ||
+        die "$0: $!";
+
+    my ($port) = getservbyname ('time','tcp')  ||
+        die "$0: $!";
+
+    my ($client_addr) = (gethostbyname ($client))[4];
+
+    #####################################################################
+    #
+    #  The test whether or not a machine is up/down consists of
+    #  opening a socket and connecting to the peer (host) within 
+    #  $timeout seconds.  If the connect is made, then the machine
+    #  is considered up; otherwise, the machine is down. $downFlag
+    #  is the global flag that is returned to the calling function.
+    #
+    #####################################################################
+
+    eval << 'END_OF_TIMEOUT';
+        
+	alarm ($timeout);
+
+        socket (SOCK, PF_INET, SOCK_STREAM, $proto) ||
+            die "Socket: $!";
+
+        my ($packFormat) = 'S n a4 x8';
+
+        if (connect (SOCK,pack($packFormat,AF_INET(),$port,$client_addr)))
+	  {
+	    # Read client's time
+	    if (read (SOCK,$timeStamp,4) <= 0 )
+	      {
+		$timeStamp = 0;
+		$status = $NOT_FUNC;
+	      }
+	    else
+	      {
+	    	$timeStamp = unpack('N', $timeStamp);
+	    	$timeStamp = $timeStamp - $delta;
+	      }
+	  }
+	else
+	  {
+	    $status = 1;
+            die "\nHost not responding: $!\n";
+	  }
+
+	# Set status to $DOWN if connection refused
+        $status = $DOWN
+	    if (index($!,'onnection refused') != -1);
+	
+	alarm(0);			# Reset alarm clock
+END_OF_TIMEOUT
+    close (SOCK);
+
+    return ($status,$timeStamp);
+  }
+
+sub log_down
+  {
+    my ($downLog)	= shift;
+    my ($wwwpath)	= shift;
+    my (%downListTab) 	= @_;
+    my ($downcount) = 0;
+    my ($host) = "";
+
+    open (DOWN,">$downLog") or
+        die "\nCannot open $downLog\n";
+
+    foreach $host (sort(keys(%downListTab))) 
+      { 
+	next if ( $ignoreList{$host} );
+	next if ( !$machStat{$host} );
+	$downcount = $downListTab{$host}; 
+	printf DOWN "%s %d\n",$host,$downcount;
+      }
+    
+    close (DOWN);
+    print "\nHosts DOWN: ",count_db(%downListTab),"\n";
+
+    # Generate HTML document
+    html_down ($wwwpath,%downListTab);
+
+    return;
+  }
+
+
+sub log_up
+  {
+    my	($upLog)    	= shift;
+    my 	(%statusTab) 	= @_;
+    my ($up_count) 	= 0;
+    my ($uphost) 	= "";
+
+    open (UPLOG,">$upLog") or
+        warn "\nCannot open $upLog\n";
+
+    foreach $uphost (sort(keys(%statusTab))) 
+      { 
+	if ($statusTab{$uphost}[0] == 0)
+	  {
+	    $up_count++;
+	    print UPLOG $uphost,"\n";
+	  }
+      }
+
+    close (UPLOG);
+    print "\nHosts UP:  ",$up_count;
+
+    return;
+  }
+
+sub get_timestamp
+  {
+    my $dateString = sprintf ("%02d/%02d/%d-%02d:%02d",
+			localtime->mon()+1,
+			localtime->mday(),
+			localtime->year() + 1900,
+			localtime->hour(),
+			localtime->min() );
+    
+    return $dateString;
+  }
+
+    
+sub clean_exit 
+  {
+    print "\nShutting down whatsup ... \n";
+    unlink ("/tmp/whatsup.pid") if ( -f "/tmp/whatsup.pid");
+    exit (0);
+  }
+
+sub html_down
+  {
+    my $wwwpath  = shift;
+    my $downList = @_;
+    my $host = "";
+    my $count = 0;
+    my $timestamp = get_timestamp ();
+    my $timedown = 0;
+    my $scan_idle = $runConfig{'SCANIDLE'};
+
+
+    open (HTML,">$wwwpath/down.html") or
+	die "$!\n";
+    
+    print HTML "
+	<html>
+	<!Generated web page showing down systems from whatsup>
+	<title>DOWN SYSTEMS LIST</title>
+	<head><h3><center>DOWN SYSTEMS LIST as of $timestamp </center></h3>
+
+	<table border>
+	<tr>
+	<tr>
+	    <th>Hostname</th>
+	    <th>HrsDn</th>
+	    <th>Type</th>
+	    <th>Crit</th>
+	</tr> \n";
+
+    foreach $host (sort(keys(%downList)))
+      {
+	next if ( $ignoreList{$host} );
+	$count++;		    # Counter number of nodes down
+	
+	my $node_type = (index($host,"hpes") != -1) ? "WS" : "SV";
+	my $critical  = "N";
+	my $timedown = sprintf "%.2f",$scan_idle*$downList{$host}/3600;
+
+	print HTML "
+	    <tr>
+		<td>$host</td>
+		<td>$timedown</td>
+		<td>$node_type</td>
+		<td>$critical</td>
+	    </tr> \n";
+      }
+
+    print HTML "</table> \n";
+    print HTML "<h4>Nodes Down: $count</h4> \n";
+
+    print HTML "
+	<p>HrsDn  -- consecutive Hours down since </p>
+	<p>Type   -- WS=desktop, SV=server</p>
+	<p>Crit   -- node (Y) is, (N) not a critical server</p> ";
+
+    close (HTML);
+
+    return;
+  }
+
+sub log_state
+  {
+    my	$wwwpath    = shift;	    # Path for web pages
+    my	$ntp_time   = shift;	    # NTP server's time stamp
+    my	%db	    = @_;
+    my  $func_count = 0;	    # Number of non-functional nodes
+    my	$down_count = 0;	    # Number of nodes down
+    my	$time_count = 0;	    # Number of nodes out of time sync
+    my	$up_count   = 0;	    # Number of nodes up
+    my	$node_count = 0;	    # Total number of nodes
+    my	$ctime	    = 0;
+    my	$timestamp  = get_timestamp();
+    my	$drift	    = 0;
+    my	$drift_tag  = "";
+
+    my	@state_types = qw (UP DOWN EXCL TIME);
+    my	$state = "";
+
+    open (HTML,">$wwwpath/state.html") 
+	or die "$0: $!\n";
+
+    # Get formatted time string for NTP time
+    $ctime = get_timestring($ntp_time);
+
+    print HTML "
+	<html>
+	<!Generated web page showing systems states from whatsup>
+	<title>STATE OF SYSTEMS</title>
+	<head><h3><center>STATE OF SYSTEMS as of $timestamp </center></h3>
+
+	<BODY BGCOLOR=\"#FFFFFF\">
+
+        <h4><center>Time from NTP server is $ctime </center></h4> 
+
+	<table border>
+	<tr>
+	<tr>
+	    <th>Hostname  </th>
+	    <th>State  </th>
+	    <th>Time  </th>
+	    <th>Sec Diff  </th>
+	    <th>Drift  </th>
+	</tr> \n";
+
+
+    # Insert DOWN systems into the table first
+    foreach $host (sort(keys(%db)))
+      {
+	next if ($db{$host}[0] != $DOWN || $db{$host}[0] == $EXCLUDED);
+
+	$down_count++;
+	$ctime = "00/00/0000 00:00:00";
+	$drift = 0;
+	$drift_tag = "*";
+	$state = $state_types[$DOWN];
+
+	# These rows will be shown in RED
+	print HTML "
+	    <tr>
+		<td bgcolor=\"#FF6347\"><b>$host</b></td>
+		<td bgcolor=\"#FF6347\"><b>$state</b></td>
+		<td bgcolor=\"#FF6347\"><b>$ctime</b></td>
+		<td bgcolor=\"#FF6347\"><b>$drift</b></td>
+		<td bgcolor=\"#FF6347\"><center><b>$drift_tag</center></b></td> 
+	    </tr> \n";
+      }
+
+    # Insert NOT_FUNC (non functional) machines
+    foreach $host (sort(keys(%db)))
+      {
+	next if ( $db{$host}[0] != $NOT_FUNC );
+
+	$ctime = "00/00/0000 00:00:00";
+	$drift = 0;
+	$drift_tag = "*";
+	$func_count++;
+	$state = $state_types[$NOT_FUNC];
+	
+	# These lines will be highlighted in yellow
+	print HTML "
+	    <tr>
+		<td bgcolor=\"#FFFF00\"><b>$host</b></td>
+		<td bgcolor=\"#FFFF00\"><b>$state</b></td>
+		<td bgcolor=\"#FFFF00\"><b>$ctime</b></td>
+		<td bgcolor=\"#FFFF00\"><b>$drift</b></td>
+		<td bgcolor=\"#FFFF00\"><center><b>$drift_tag</center></b></td> 
+	    </tr> \n";
+      }
+
+    # Insert TIME problem machines next
+    foreach $host (sort(keys(%db)))
+      {
+	next if ($db{$host}[0] != $TIME_SYNC);
+
+	$ctime = "";
+	$drift = 0;
+	$time_count++;
+	$state = $state_types[$TIME_SYNC];
+
+	$ctime = $db{$host}[1];		# Get node's time
+	$drift = $db{$host}[2];
+
+	if ($drift == 0)
+	  {
+	    # The node's time is sync'd with NTP server
+	    $drift_tag = "=";
+	  }
+	elsif ($drift < 0)
+	  {
+	    # The node is slower in time
+	    $drift_tag = "-";
+	  }
+	else
+	  {
+	    # The nodes is ahead in time
+	    $drift_tag = "+";
+	  }
+
+	# Convert time to formatted string
+	$ctime = sprintf "%02d/%02d/%4d %02d:%02d:%02d",
+                    localtime($ctime)->mon+1,
+                    localtime($ctime)->mday,
+                    localtime($ctime)->year + 1900,
+                    localtime($ctime)->hour,
+                    localtime($ctime)->min,
+                    localtime($ctime)->sec;
+
+	# These rows will be displayed in GOLD
+	print HTML "
+	    	<tr>
+		<td bgcolor=\"#ffff00\"><b>$host</b></td>
+		<td bgcolor=\"#ffff00\"><b>$state</b></td>
+		<td bgcolor=\"#ffff00\"><b>$ctime</b></td>
+		<td bgcolor=\"#ffff00\"><b>$drift</b></td>
+		<td bgcolor=\"#ffff00\"><center><b>$drift_tag</center></b></td> 
+		</tr> \n";
+      }
+
+    # Insert UP systems
+    foreach $host (sort(keys(%db)))
+      {
+	next if ($db{$host}[0] != $UP);
+
+	# Count number of UP nodes
+	$up_count++;
+
+	# Reset time values
+	$ctime = $drift = 0;
+
+	$state = $state_types[$UP];
+	$ctime = $db{$host}[1];		# Get node's time
+	$drift = $db{$host}[2];
+
+	if ($drift == 0)
+	  {
+	    # The node's time is sync'd with NTP server
+	    $drift_tag = "=";
+	  }
+	elsif ($drift < 0)
+	  {
+	    # The node is slower in time
+	    $drift_tag = "-";
+	  }
+	else
+	  {
+	    # The nodes is ahead in time
+	    $drift_tag = "+";
+	  }
+
+	# Convert time to formatted string
+	$ctime = sprintf "%02d/%02d/%4d %02d:%02d:%02d",
+                    localtime($ctime)->mon+1,
+                    localtime($ctime)->mday,
+                    localtime($ctime)->year + 1900,
+                    localtime($ctime)->hour,
+                    localtime($ctime)->min,
+                    localtime($ctime)->sec;
+
+	print HTML "
+	    	<tr>
+		<td>$host</td>
+		<td>$state</td>
+		<td>$ctime</td>
+		<td>$drift</td>
+		<td><center>$drift_tag</center></td> 
+		</tr> \n";
+	}
+
+    print HTML "</table> \n";
+
+    $node_count = $down_count + $time_count + $up_count;
+
+    print HTML "<h4>Nodes UP = $up_count, DOWN = $down_count, NOT TIME SYNC'D = $time_count, TOTAL = $node_count </h4>";
+	    
+    print HTML "\n</html>\n";
+
+    close (HTML);
+
+    return;
+  }
+
+sub print_nodedb
+  {
+    my	%db	= @_;
+    my	$host	= "";
+    my	$state  = "";
+    my	$ctime  = "";
+    my	$drift_tag = "";
+    my  $timestamp = "";
+
+    foreach $host (sort(keys(%db)))
+      {
+	next if ( $db{$host}[0] == $EXCLUDED );
+
+	if ($db{$host}[0] == $UP) 
+	  {
+	    $state = "UP";
+	  }
+	else
+	  {
+	    $state = "DOWN";
+	  }
+	    
+	if ( $db{$host}[0] == $DOWN )
+	  {
+	    $ctime = "00/00/00 00:00";
+	    $drift_tag = "*";
+	  }
+	else
+	  {
+	    if ($db{$host}[2] == 0) 
+	      { 
+		$drift_tag = "="; 
+	      }
+	    elsif ($db{$host}[2] < 0) 
+	      { 
+		$drift_tag = "<"; 
+	      }
+	    else 
+	      { 
+		$drift_tag = ">"; 
+	      }
+
+	    $timestamp = $db{$host}[1];
+	    
+	    $ctime = sprintf "%02d/%02d/%4d %02d:%02d:%02d",
+                    localtime($timestamp)->mon+1,
+                    localtime($timestamp)->mday,
+                    localtime($timestamp)->year + 1900,
+                    localtime($timestamp)->hour,
+                    localtime($timestamp)->min,
+		    localtime($timestamp)->sec;
+	  }
+
+	printf STDOUT "\n%-10s   %-5s   %-12s   %c", 
+	    $host,$state,$ctime,$drift_tag;
+      }
+    
+    print STDOUT "\n";
+
+    return;
+  }
+
+sub print_data
+  {
+    my	%db	= @_;
+
+    foreach $host (sort(keys(%db)))
+      {
+	next if ( $db{$host}[0] == $EXCLUDED );
+	printf "\n%-10s  %d   %12d  %12d",
+	    $host,$db{$host}[0],$db{$host}[1],$db{$host}[2];
+      }
+    
+    print "\n";
+    
+    return;
+  }
+
+sub print_exclude
+  {
+    my	%db 	= @_;
+    my	$node	= "";
+
+    foreach $node (sort(keys %db))
+      {
+	print $node,"\n";
+      }
+    
+    return;
+  }
+
+
+sub get_timestring
+  {
+    my	$timestamp = shift;
+    my	$ctime = "";
+
+    $ctime = sprintf "%02d/%02d/%4d %02d:%02d:%02d",
+                    localtime($timestamp)->mon+1,
+                    localtime($timestamp)->mday,
+                    localtime($timestamp)->year + 1900,
+                    localtime($timestamp)->hour,
+                    localtime($timestamp)->min,
+                    localtime($timestamp)->sec;
+
+    return ($ctime);
+  }
+
+
+sub do_getpid
+  {
+    my $proc_key = shift;
+    my $pid = 0;
+    my @procFields;
+
+    return (0) if ( $proc_key eq "" );
+
+    my @ProcTable = `ps -e`;
+    my @ProcEntry = grep(/$proc_key/,@ProcTable);
+
+    $pid = ((split(/\s+/,$ProcEntry[0]))[1])
+        if ( $#ProcEntry >= 0 );
+
+    return ($pid)
+  }
+
+sub sig_hup
+  {
+    print STDERR "Aborted test of $testing_host\n";
+    return;
+  };
