@@ -1,0 +1,588 @@
+#!/bin/sh
+#
+# Configure the admin user entry in /etc/passwd.
+#
+# Willie Lopez <willie.lopez@hp.com> 
+
+PATH=/opt/local/bin:/usr/bin:/usr/sbin:/sbin:$PATH
+PATH=/var/opt/sysconf-svto/bin:/var/opt/sysconf/bin:$PATH
+PATH=$(dirname $0):$(dirname $0)/../bin:$(dirname $0)/../../sysconf/bin:$PATH
+
+. sysconf-common
+
+nets=$(print_nets $IP_ADDRESS_OVERRIDE)
+if [ -z "$nets" ]; then
+  : "Could not determine network.  Unable configure admin accounts."
+  exit 0
+fi
+
+if ! grep -q '^root:' /etc/passwd; then
+  msg "Error: /etc/passwd file is corrupt.  Exiting without changes."
+  exit 1
+fi
+
+###############################################################################
+# Manage the NIS token in the /etc/passwd file.
+
+token="+::-2:-2147483648:::"
+
+tmpfile=/etc/passwd.tmp.$$~
+current_token=$(grep "^+" /etc/passwd)
+case "$current_token" in
+$token)
+	: already have correct NIS token, do nothing
+	;;
+"")
+	: no NIS token present, do nothing
+	;;
+*)
+	: incorrect NIS token present, fix it
+	msg "NIS token $current_token"
+	sed -n -e '/^+/q' -e p /etc/passwd | grep -v "^+" > $tmpfile
+	echo $token >> $tmpfile
+	sed -n '/^+/,$p' /etc/passwd | grep -v "^+" >> $tmpfile
+	# Be paranoid and don't let a full disk hurt us.
+	if [ ! -s $tmpfile ]; then
+	  msg "Error: Problem editing a temp passwd file.  Skipping."
+	  exit 1
+	fi
+	if ! grep -q '^root:' $tmpfile; then
+	  msg "Error: Problem editing a tmp passwd file.  Skipping."
+	  exit 1
+	fi
+	cp /etc/passwd /etc/passwd~
+	mv $tmpfile /etc/passwd
+	msg "Updated /etc/passwd file for NIS token."
+	msg new NIS token $(grep "^+" /etc/passwd)
+	;;
+esac
+
+###############################################################################
+# Manage the admin account in the /etc/passwd file.
+
+login="admin"
+## CHANGE PASSWORD HERE
+#pass="cUSuppXEs730c"
+#pass="1y8qYbR1GWGfU" #20050401
+pass="3qQz/pMqw6bL2"
+uid=0
+gid=0
+gcos="IT Ken Martindale,HP,ken.martindale@hp.com,970-898-7863"
+home=/admin
+shell=/bin/bash
+
+# Strip off password aging because it causes interoperability issues between
+# Linux infrastructures and HP-UX clients
+pass="$(echo $pass | sed 's/,.*//')"
+
+tmpfile=/etc/passwd.tmp.$$~
+pline="$login:$pass:$uid:$gid:$gcos:$home:$shell"
+: "$pline"
+
+# Check that our line is in the file and occurs before any NIS line.
+current_pline=$(sed -n -e '/^+/q' -e p /etc/passwd | grep "^$login:")
+if [ _"$pline" != _"$current_pline" ]; then
+  : /etc/passwd needs update
+  sed -n -e '/^+/q' -e p /etc/passwd | grep -v "^$login:" > $tmpfile
+  echo "$login:$pass:$uid:$gid:$gcos:$home:$shell" >> $tmpfile
+  sed -n '/^+/,$p' /etc/passwd | grep -v "^$login:" >> $tmpfile
+  # Be paranoid and don't let a full disk hurt us.
+  if [ ! -s $tmpfile ]; then
+    msg "Error: Problem editing a temp passwd file.  Skipping."
+    exit 1
+  fi
+  if ! grep -q '^root:' $tmpfile; then
+    msg "Error: Problem editing a tmp passwd file.  Skipping."
+    exit 1
+  fi
+  cp /etc/passwd /etc/passwd~
+  mv $tmpfile /etc/passwd
+  msg "Updated /etc/passwd file for $login entry update."
+fi
+
+###############################################################################
+# Manage the files in the /admin home directory.
+
+cnfdir=/var/opt/sysconf-svto/newconfig
+
+if [ -w / ]; then # Avoid non-root testing noise.
+
+  test -f /admin/.hushlogin || touch /admin/.hushlogin
+
+  mkdir -p /admin/.ssh
+  check_n_set_perm_root_rwx_only /admin /admin/.ssh /admin/bin
+
+  cmp_copy_exit $cnfdir/admin/.ssh/authorized_keys /admin/.ssh/
+  check_n_set_perm_root_only /admin/.ssh/authorized_keys
+
+  cmp_copy_exit $cnfdir/admin/.profile /admin/
+  cmp_copy_exit $cnfdir/admin/.bashrc /admin/
+  check_n_set_perm_root_only /admin/.profile /admin/.bashrc
+  cmp_copy_exit $cnfdir/admin/.forward /admin/
+  check_n_set_perm_root_only /admin/.forward
+  cmp_copy_exit $cnfdir/admin/.inputrc /admin/
+  test -f /admin/.rhosts && rm -f /admin/.rhosts
+
+  mkdir -p /admin/bin
+  # nfs_umount  supported by Willie Lopez
+  cmp_copy_exit $cnfdir/admin/bin/fuser.sh /admin/bin/
+  cmp_copy_exit $cnfdir/admin/nfs_umount /admin/bin/nfs_umount
+  # nfs_patch_check  supported by Brian Weaver/WTEC
+  cmp_copy_exit $cnfdir/admin/nfs_patch_check /admin/bin/nfs_patch_check
+  # automount_check.pl  supported by Larry Neelis
+  cmp_copy_exit $cnfdir/admin/automount_check.pl /admin/bin/automount_check.pl
+  # autotest.sh  supported by Willie Lopez
+  cmp_copy_exit $cnfdir/admin/autotest.sh /admin/bin/autotest.sh
+  # irecovery  supported by Larry Neelis
+  cmp_copy_exit $cnfdir/admin/irecovery.legacy /admin/bin/irecovery
+  # netdir_clean  supported by Willie Lopez
+  cmp_copy_exit $cnfdir/admin/netdir_clean /admin/bin/netdir_clean
+  # getdirmnts  supported by Willie Lopez
+  cmp_copy_exit $cnfdir/admin/getdirmnts /admin/bin/getdirmnts
+  # lockcheck.pa - Simple file locking test for rpc.lockd
+  cmp_copy_exit $cnfdir/admin/lockcheck.pa /admin/bin/lockcheck.pa
+  # setup-user supported by Larry Neelis
+  cmp_copy_exit $cnfdir/admin/bin/setup-user /admin/bin/setup-user
+
+  mkdir -p /admin/etc
+  # .bashrc supported by Kevin Safford & Bob Proulx
+  cmp_copy_exit $cnfdir/admin/etc/.bashrc /admin/etc/
+  # .bash_profile supported by Kevin Safford & Bob Proulx
+  cmp_copy_exit $cnfdir/admin/etc/.bash_profile /admin/etc/
+  # .xsession supported by Bob Proulx
+  cmp_copy_exit $cnfdir/admin/etc/.xsession /admin/etc/
+  # .kshrc supported by SSO
+  cmp_copy_exit $cnfdir/admin/etc/.kshrc /admin/etc/
+  # .cshrc supported by SSO
+  cmp_copy_exit $cnfdir/admin/etc/.cshrc /admin/etc/
+  # .dtprofile supported by SSO
+  cmp_copy_exit $cnfdir/admin/etc/.dtprofile /admin/etc/
+  # .dtwmrc supported by Doug Lindsley
+  cmp_copy_exit $cnfdir/admin/etc/.dtwmrc /admin/etc/
+  # .profile supported by SSO
+  cmp_copy_exit $cnfdir/admin/etc/.profile /admin/etc/
+  # autoproxy supported by Bob Proulx
+  cmp_copy_exit $cnfdir/admin/etc/autoproxy /admin/etc/
+
+  mkdir -p /admin/nfsshow
+  check_n_set_rx_perm /admin/nfsshow
+  cmp_copy $cnfdir/admin/nfsshow-a-2 /admin/nfsshow/nfsshow-a-2
+  cmp_copy $cnfdir/admin/autofs-lp64.object /admin/nfsshow/autofs-lp64.o
+  cmp_copy $cnfdir/admin/autofs-ilp32.object /admin/nfsshow/autofs-ilp32.o
+  cmp_copy $cnfdir/admin/nfsstruct-ilp32.object /admin/nfsshow/nfsstruct-ilp32.o
+  cmp_copy $cnfdir/admin/nfsstruct-lp64.object /admin/nfsshow/nfsstruct-lp64.o
+  [ ! -h /admin/nfsshow/nfsshow ] && ln -s /admin/nfsshow/nfsshow-a-2 /admin/nfsshow/nfsshow
+
+fi
+
+###############################################################################
+# Manage the admin2 account in the /etc/passwd file.
+
+login="admin2"
+
+tmpfile=/etc/passwd.tmp.$$~
+pline="$login:$pass:$uid:$gid:$gcos:$home:$shell"
+: "$pline"
+
+# Check that our line is in the file and occurs before any NIS line.
+current_pline=$(sed -n -e '/^+/q' -e p /etc/passwd | grep "^$login:")
+if [ _"$pline" != _"$current_pline" ]; then
+  : /etc/passwd needs update
+  sed -n -e '/^+/q' -e p /etc/passwd | grep -v "^$login:" > $tmpfile
+  echo "$login:$pass:$uid:$gid:$gcos:$home:$shell" >> $tmpfile
+  sed -n '/^+/,$p' /etc/passwd | grep -v "^$login:" >> $tmpfile
+  # Be paranoid and don't let a full disk hurt us.
+  if [ ! -s $tmpfile ]; then
+    msg "Error: Problem editing a temp passwd file.  Skipping."
+    exit 1
+  fi
+  if ! grep -q '^root:' $tmpfile; then
+    msg "Error: Problem editing a tmp passwd file.  Skipping."
+    exit 1
+  fi
+  cp /etc/passwd /etc/passwd~
+  mv $tmpfile /etc/passwd
+  msg "Updated /etc/passwd file for $login entry update."
+fi
+
+###############################################################################
+# Manage the stress account in the /etc/passwd file.
+
+login="stress"
+# Use the same password as admin.  Not really used since we actually
+# use authorized_keys and .rhosts to give an access list.  But cannot
+# use "*" or rlogin will be disabled.  So just use the same valid
+# password that the 'admin' account uses.
+uid=13658  # unique non-privileged uid
+gid=2000   # useful to be in common group since UPG not implemented here.
+gcos="Sir Robert Proulx,HP,bob.proulx@hp.com,970-898-3658,"
+home=/usr/stress
+shell=/bin/bash
+
+# Only HP-UX implements this type of password aging.
+# But it is the majority case today.  Just strip it off if we are not hpux.
+case "$os" in
+hpux*) ;;
+*) pass="$(echo $pass | sed 's/,.*//')" ;;
+esac
+
+tmpfile=/etc/passwd.tmp.$$~
+pline="$login:$pass:$uid:$gid:$gcos:$home:$shell"
+: "$pline"
+
+# Check that our line is in the file and occurs before any NIS line.
+current_pline=$(sed -n -e '/^+/q' -e p /etc/passwd | grep "^$login:")
+if [ _"$pline" != _"$current_pline" ]; then
+  : /etc/passwd needs update
+  sed -n -e '/^+/q' -e p /etc/passwd | grep -v "^$login:" > $tmpfile
+  echo "$login:$pass:$uid:$gid:$gcos:$home:$shell" >> $tmpfile
+  sed -n '/^+/,$p' /etc/passwd | grep -v "^$login:" >> $tmpfile
+  # Be paranoid and don't let a full disk hurt us.
+  if [ ! -s $tmpfile ]; then
+    msg "Error: Problem editing a temp passwd file.  Skipping."
+    exit 1
+  fi
+  if ! grep -q '^root:' $tmpfile; then
+    msg "Error: Problem editing a tmp passwd file.  Skipping."
+    exit 1
+  fi
+  cp /etc/passwd /etc/passwd~
+  mv $tmpfile /etc/passwd
+  msg "Updated /etc/passwd file for $login entry update."
+fi
+
+###############################################################################
+# Manage the files in the /usr/stress home directory.
+
+cnfdir=/var/opt/sysconf-svto/newconfig
+
+if [ -w / ]; then # Avoid non-root testing noise.
+
+  if [ -d $cnfdir/usr/stress ]; then
+    rsync -a --delete $cnfdir/usr/stress/ /usr/stress/
+  fi
+
+fi
+
+###############################################################################
+# Manage the root password on any system that sends email to the admin team.
+
+login="root"
+## CHANGE PASSWORD HERE
+#pass="nXTQSR6w6IXFI"
+#pass="Xh4suS4Cl51rY" # 20050401
+pass="xqTtv.k5WS556"
+
+# Strip off password aging because it causes interoperability issues between
+# Linux infrastructures and HP-UX clients
+pass="$(echo $pass | sed 's/,.*//')"
+
+# Determine if we should be managing the root password or not.
+# To tell sysconf that it does not need to update the root password,
+# set the /root/.forward to go to local user
+# DEFAULT STATE is manage_pw=false
+manage_pw=false
+
+# Check the aliases file.  If there is a local root alias then someone
+# has done a normal thing and redirected root mail to themself or
+# elsewhere by using the aliases file.  Since this is typical and
+# normal respect these settings.
+
+forward_file=false
+test -f /etc/aliases && aliases=/etc/aliases
+test -f /etc/mail/aliases && aliases=/etc/mail/aliases
+if [ -n "$aliases" ]; then
+  rootalias=$(grep '^[ 	]*root[ 	]*:' $aliases | tail -n 1 \
+    | sed -e 's/#.*//' -e 's/.*:[ 	]*//')
+  if [ -z "$rootalias" ]; then
+    # There is no alias entry so mail will default to the forward file.
+    forward_file=true
+  else
+    # There is an alias entry.  Check that it points back to root.
+    # Aliasing root back to root@localhost is actually a very wierd
+    # configuration and is not the recommended practice.  It seems to
+    # be done only to work around bugs in the hp medusa checker which
+    # require a root alias in the file coupled with coe which cannot
+    # merge local overrides properly into a global default.  Wierd
+    # practices to work around poorly written security tools.  Sigh.
+    case "$rootalias" in
+    root@localhost) forward_file=true ;;
+    esac
+  fi
+fi
+
+# There was either no root alias or an alias that pointed back to the
+# local machine.  In that case the forward file controls the
+# desination.  Check it for forwarding to any of the admin lists which
+# start with etladmin, mtladmin, etc. but all have the common suffix
+# of admin@vtc-domo.
+# UPDATE: no they don't, often .forward contains something like just
+# "cvl_sysadmin" which breaks the above.  I made it look for just
+# 'admin' which is possibly too generic, but it's not a huge disaster
+# if we change someone's root password, since we'll hear about it
+# quickly and can fix it easily. -kgm 3/2003
+
+if $forward_file; then
+  if [ ! -f /root/.forward ]; then
+    # Here is a case that we correct as we go.  Up until this next
+    # instant mail has been getting delivered locally to root.  Which
+    # is contrary to all guidelines.  Correct all unforwarded
+    # installations so that it forwards to a generic system admin
+    # email mailing list where it will be handled there.
+    mkdir -p /root
+    echo gen_sysadmin > /root/.forward
+    chown root:root /root/.forward
+    chmod 0644 /root/.forward
+  fi
+  if [ -f /root/.forward ]; then
+    if grep -q 'admin' /root/.forward; then
+      manage_pw=true
+    fi
+  fi
+fi
+
+: trace manage_pw is $manage_pw before hostname checks
+
+# GENERIC ROOT PASSWD
+# List out the hosts that we manage because they are named as a shared
+# resource regardless of where the email is forwarded.  Exceptions to 
+# wildcards must be listed first with "manage_pw=false"
+# ORDER IS CRITICAL - DO NOT SORT THIS LIST!
+
+case "$host" in
+mtlstf4) manage_pw=false ;;
+cvl*) manage_pw=true ;;
+cvs*) manage_pw=false ;;
+dlx*) manage_pw=false ;;
+etl*) manage_pw=true ;;
+everst[0-9]*) manage_pw=true ;;
+tigw) manage_pw=true ;;
+evrst[0-9]*) manage_pw=true ;;
+ptgsetup) manage_pw=false ;;
+ftcbks*) manage_pw=false ;;
+fmltmp*) manage_pw=true ;;
+fml-wg1) manage_pw=false ;;
+fmlmako) : using defaults ;;
+fml*) manage_pw=true ;;
+mtldst*) manage_pw=false ;;
+mtl*) manage_pw=true ;;
+svtc*) manage_pw=true ;;
+svto*) manage_pw=true ;;
+trinity) manage_pw=true ;;
+vtc*) manage_pw=true ;;
+esac
+
+: trace manage_pw is $manage_pw after hostname checks
+
+# CUSTOM ROOT PASSWD
+# List out the hosts that need special root passwords.
+# Special service for limited machines, L:OPS still manages root email
+
+case "$host" in
+## CHANGE PASSWORD HERE
+blazerc)           pass="ghjBaoIpGcc6o" ;; # clint
+cvs*)              pass="lVEstelXDKh6c" ;; # lneelis
+dlx*)              pass="lVEstelXDKh6c" ;; # lneelis
+envoyc)            pass="ghjBaoIpGcc6o" ;; # clint
+everst[0-9]*)      pass="ghjBaoIpGcc6o" ;; # deans
+evrst[0-9]*)       pass="ghjBaoIpGcc6o" ;; # deans
+tigw)	           pass="ghjBaoIpGcc6o" ;; # chris norman
+fmladmws)          pass="ghjBaoIpGcc6o" ;; # mab
+fmlarc[0-9]*)      pass="ghjBaoIpGcc6o" ;; # scott
+fmlarv[0-9]*)      pass="ghjBaoIpGcc6o" ;; # scott
+fmldmws[0-9]*)     pass="ghjBaoIpGcc6o" ;; # mab
+fmldsys[0-9]*)     pass="ghjBaoIpGcc6o" ;; # mab
+fmlevews)          pass="ghjBaoIpGcc6o" ;; # mab
+fmlgrn1)           pass="1hVH2iq1v5BFM" ;; # ajt
+fmlscan[0-9]*)     pass="ghjBaoIpGcc6o" ;; # mab
+fmlsherz)          pass="ghjBaoIpGcc6o" ;; # mab
+fmlshtr1)          pass="ghjBaoIpGcc6o" ;; # mab
+fmlshv5[0-9])      pass="ghjBaoIpGcc6o" ;; # mab
+fmlsoc1)           pass="lRcZFybvByZL2" ;; # mgr
+fmlwsfan)          pass="ghjBaoIpGcc6o" ;; # mab
+honde*)            pass="7uGHypykHNTTA" ;; # caf
+hummerc)           pass="ghjBaoIpGcc6o" ;; # clint
+icebreak)          pass="ghjBaoIpGcc6o" ;; # clint
+kmhc)              pass="ghjBaoIpGcc6o" ;; # clint
+mtlfn*)            pass="7uGHypykHNTTA" ;; # caf
+mtlmke*)           pass="7uGHypykHNTTA" ;; # caf
+mtlmkf*)           pass="7uGHypykHNTTA" ;; # caf
+mtlscon*)          pass="FnLZK9OCKKSz6" ;; # jdg
+muranoc)           pass="ghjBaoIpGcc6o" ;; # clint
+precu[afs][0-9]*)  pass="ghjBaoIpGcc6o" ;; # mab
+presys[0-9]*)      pass="ghjBaoIpGcc6o" ;; # mab
+roverc)            pass="ghjBaoIpGcc6o" ;; # clint
+svlareve)          pass="ghjBaoIpGcc6o" ;; # scott
+svlboot0)          pass="ghjBaoIpGcc6o" ;; # clint
+tahoec)            pass="ghjBaoIpGcc6o" ;; # clint
+xterrac)           pass="ghjBaoIpGcc6o" ;; # clint
+yukonc)            pass="ghjBaoIpGcc6o" ;; # clint
+esac
+
+# Strip off password aging because it causes interoperability issues between
+# Linux infrastructures and HP-UX clients
+pass="$(echo $pass | sed 's/,.*//')"
+
+if $manage_pw; then
+
+  sed -n -e '/^+/q' -e "/^$login:/p" /etc/passwd \
+    | head -n 1 > /tmp/passwd1.tmp.$$~
+  test $? -ne 0 && exit 1
+  if [ ! -s /tmp/passwd1.tmp.$$~ ]; then
+    msg "Error: empty /tmp/passwd1.tmp.$$~.  Disk full?"
+    exit 1
+  fi
+
+  prevline=$(sed "s/^$login:[^:]*://" /tmp/passwd1.tmp.$$~)
+  echo "$login:$pass:$prevline" > /tmp/passwd.tmp.$$~
+  test $? -ne 0 && exit 1
+  if [ ! -s /tmp/passwd.tmp.$$~ ]; then
+    msg "Error: empty /tmp/passwd.tmp.$$~.  Disk full?"
+    exit 1
+  fi
+  unset prevline
+
+  if ! cmp -s /tmp/passwd1.tmp.$$~ /tmp/passwd.tmp.$$~; then
+    msg "Need to change $login password in /etc/passwd"
+    if ! cp /etc/passwd /etc/passwd~; then # save a backup
+      exit 1
+    fi
+    mv /tmp/passwd.tmp.$$~ /etc/
+    grep -v "^$login:" /etc/passwd >> /etc/passwd.tmp.$$~
+    if ! grep -q '^root:' /etc/passwd.tmp.$$~; then
+      msg "Error: Possible full disk"
+      exit 1
+    fi
+    chown root:root /etc/passwd.tmp.$$~
+    chmod a=r,u+w /etc/passwd.tmp.$$~
+    mv /etc/passwd.tmp.$$~ /etc/passwd
+    msg "Updated /etc/passwd file for $login entry update."
+  fi
+fi
+
+###############################################################################
+# Manage the rootarc account in the /etc/passwd file.
+
+# Default
+rootarc=false
+
+# ROOTARC DESIGNATED MACHINES
+case "$host" in
+augur)             rootarc=true ;;
+cvlback)           rootarc=true ;;
+cvl-cv)            rootarc=true ;;
+cvllv*)            rootarc=true ;;
+cvlme*)            rootarc=true ;;
+cvlmf*)            rootarc=true ;;
+cvlmp*)            rootarc=true ;;
+cvlmte*)           rootarc=true ;;
+cvlmv*)            rootarc=true ;;
+cvlsv*)            rootarc=true ;;
+cvltmp*)           rootarc=true ;;
+czdepot)           rootarc=true ;;
+disco)             rootarc=true ;;
+dlx*)              rootarc=true ;;
+etl-back)          rootarc=true ;;
+etllily*)          rootarc=true ;;
+etltmp*)           rootarc=true ;;
+etlgen*)           rootarc=true ;;
+etlbld*)           rootarc=true ;;
+everst[0-9]*)      rootarc=true ;;
+evrst[0-9]*)       rootarc=true ;;
+ewok)              rootarc=true ;;
+fmlarc[0-9]*)      rootarc=true ;;
+fmlarv[0-9]*)      rootarc=true ;;
+fmlatlas)          rootarc=true ;;
+fmlback)           rootarc=true ;;
+fmldmws[0-9]*)     rootarc=true ;;
+fmldsys[0-9]*)     rootarc=true ;;
+fmlmako)           rootarc=true ;;
+fmlodin)           rootarc=true ;;
+fmlscan[0-9]*)     rootarc=true ;;
+fmlshv*)           rootarc=true ;;
+fmlthor)           rootarc=true ;;
+fmltmp*)           rootarc=true ;;
+fmlxc*)            rootarc=true ;;
+fmlxv*)            rootarc=true ;;
+fml-wg1)           rootarc=true ;;
+fmlwv*)            rootarc=true ;;
+fmlws[0-9]*)       rootarc=true ;;
+hpes*)             rootarc=true ;;
+hpsv*)             rootarc=true ;;
+hpsvtc[0-9]*)      rootarc=true ;;
+ilinux*)	   rootarc=true ;;
+it[1-3])           rootarc=true ;;
+mtldst*)           rootarc=true ;;
+mtlfn*)            rootarc=true ;;
+mtlgc*)            rootarc=true ;;
+mtlgj*)            rootarc=true ;;
+mtlgv*)            rootarc=true ;;
+mtlmke*)           rootarc=true ;;
+mtlmkf*)           rootarc=true ;;
+sierra)            rootarc=false ;;
+mtlscon*)          rootarc=true ;;
+mtltmp[0-9]*)      rootarc=true ;;
+mtltrj[1-3])       rootarc=true ;;
+phin)              rootarc=true ;;
+precu[afs][0-9]*)  rootarc=true ;;
+presys[0-9]*)      rootarc=true ;;
+svlareve)          rootarc=true ;;
+svlawc*)           rootarc=true ;;
+svlpc*)            rootarc=true ;;
+svlwc*)            rootarc=true ;;
+svlwq*)            rootarc=true ;;
+svlws*)            rootarc=true ;;
+svlwv*)            rootarc=true ;;
+svtoprf*)          rootarc=true ;;
+svtotrc*)          rootarc=true ;;
+trinity)           rootarc=true ;;
+vmux*)             rootarc=true ;;
+vtc-domo)          rootarc=true ;;
+esac
+
+if $rootarc; then
+
+  login="rootarc"
+  ## CHANGE PASSWORD HERE
+  #pass="fBqBZt1gsIf4o"
+  pass="GR7DUYo8XMh86"
+  uid=0
+  gid=1
+  gcos="IT Duane Likens,Kemtah,dpl@fc.hp.com,970-898-9476,"
+  home=/rootarc
+  shell=/bin/bash
+
+  # Strip off password aging because it causes interoperability issues between
+  # Linux infrastructures and HP-UX clients
+  pass="$(echo $pass | sed 's/,.*//')"
+
+  tmpfile=/etc/passwd.tmp.$$~
+  pline="$login:$pass:$uid:$gid:$gcos:$home:$shell"
+  : "$pline"
+
+  # Check that our line is in the file and occurs before any NIS line.
+  current_pline=$(sed -n -e '/^+/q' -e p /etc/passwd | grep "^$login:")
+  if [ _"$pline" != _"$current_pline" ]; then
+    : /etc/passwd needs update
+    sed -n -e '/^+/q' -e p /etc/passwd | grep -v "^$login:" > $tmpfile
+    echo "$login:$pass:$uid:$gid:$gcos:$home:$shell" >> $tmpfile
+    sed -n '/^+/,$p' /etc/passwd | grep -v "^$login:" >> $tmpfile
+    # Be paranoid and don't let a full disk hurt us.
+    if [ ! -s $tmpfile ]; then
+      msg "Error: Problem editing a temp passwd file.  Skipping."
+      exit 1
+    fi
+    if ! grep -q '^root:' $tmpfile; then
+      msg "Error: Problem editing a tmp passwd file.  Skipping."
+      exit 1
+    fi
+    cp /etc/passwd /etc/passwd~
+    mv $tmpfile /etc/passwd
+    msg "Updated /etc/passwd file for $login entry update."
+  fi
+
+fi
+
+
+###############################################################################
+exit 0

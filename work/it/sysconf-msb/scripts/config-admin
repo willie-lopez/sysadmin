@@ -1,0 +1,132 @@
+#!/bin/sh
+
+PATH=/usr/bin:/bin:/usr/local/bin:.
+
+pwfile=/etc/passwd
+tmpfile=/tmp/passwd.$$
+hostsfile=/etc/hosts
+
+# Make sure we have a passwd file to work with, if not, it's a fatal error
+if [ ! -f $pwfile ] ; then
+  echo "Error: $pwfile is missing!"
+  exit 1
+fi
+
+# And make sure root is in /etc/passwd, if not, it's a fatal error
+if ! grep '^root:' $pwfile >/dev/null 2>&1 ; then
+  echo "Error: $pwfile is missing the root users!"
+  exit 1
+fi
+
+# Get our IP address from DNS and make sure we are on a subnet
+# we are configuring.
+if grep $(hostname) $hostsfile >/dev/null 2>&1 ; then
+  caddr=$(grep `hostname` $hostsfile | awk '{print$1}')
+else
+  caddr=$(nslookup `hostname` | grep Address | tail -1 | awk -F: '{print$2}')
+fi
+
+case "$caddr" in 
+    15.2.11[2-9]*)       config_flag=true        ;;      
+    15.2.[67][0-4]*)     config_flag=true        ;;
+esac
+
+cname=$(hostname)
+
+if ! $config_flag ; then
+  echo "This client $cname with IP address $caddr is NOT configurable"
+  exit 1
+fi
+
+
+# Manage the NIS token
+all_access_token="+::-2:-2:::"
+no_access_token="+:*:-2:-2:::/bin/false"
+
+current_token=$(grep "^+:" $pwfile)     # Take ONLY the NIS token!!
+current_passwd=$(awk -F: '{if ($1 == "+") print$2}' $pwfile)
+current_shell=$(awk -F: '{if ($1 == "+") print$7}' $pwfile)
+
+case "$current_token" in 
+  $token)               ;;      # Do nothing, token is correct
+  "")                   ;;      # No token, do nothing
+  *)                            # Incorrect token, fix it
+        sed -n -e '/^+:/q' -e p $pwfile | grep -v "^+:" > $tmpfile
+        echo "$token$current_shell" >> $tmpfile
+        sed -n '/^+/,$p' $pwfile | grep -v "^+" >> $tmpfile
+        # Be paranoid and don't let a full disk hurt us.
+        if [ ! -s $tmpfile ]; then
+          echo "Error: Problem editing a temp passwd file.  Skipping."
+          exit 1
+        fi
+        if ! grep -q '^root:' $tmpfile; then
+          echo "Error: Problem editing a tmp passwd file.  Skipping."
+          exit 1
+        fi
+        cp $pwfile $pwfile~
+        mv $tmpfile $pwfile
+        echo "Updated $pwfile file for NIS token."
+        echo new NIS token $(grep "^+" $pwfile)
+        ;;
+esac
+
+
+# Manage the admin login
+login="admin"
+## CHANGE PASSWORD HERE
+pass="3qQz/pMqw6bL2"
+uid=0
+gid=0
+gcos="IT Willie Lopez,HP,willie.lopez@hp.com,970-898-7089"
+home=/admin
+shell=/bin/sh
+
+# Strip off password aging because it causes interoperability issues between
+# Linux infrastructures and HP-UX clients
+pass="$(echo $pass | sed 's/,.*//')"
+
+pline="$login:$pass:$uid:$gid:$gcos:$home:$shell"
+: "$pline"
+
+# Check that our line is in the file and occurs before any NIS line.
+current_pline=$(sed -n -e '/^+/q' -e p $pwfile | grep "^$login:")
+if [ _"$pline" != _"$current_pline" ]; then
+  : /etc/passwd needs update
+  sed -n -e '/^+/q' -e p $pwfile | grep -v "^$login:" > $tmpfile
+  echo "$login:$pass:$uid:$gid:$gcos:$home:$shell" >> $tmpfile
+  sed -n '/^+/,$p' $pwfile | grep -v "^$login:" >> $tmpfile
+  # Be paranoid and don't let a full disk hurt us.
+  if [ ! -s $tmpfile ]; then
+    echo "Error: Problem editing a temp passwd file.  Skipping."
+    exit 1
+  fi
+  if ! grep -q '^root:' $tmpfile; then
+    echo "Error: Problem editing a tmp passwd file.  Skipping."
+    exit 1
+  fi
+  cp $pwfile $pwfile~
+  mv $tmpfile $pwfile
+  echo "Updated $pwfile file for $login entry update."
+fi
+
+
+# Setup admin home directory
+if [ ! -d /admin ] ; then
+  mkdir -p /admin /admin/etc /admin/bin /admin/.ssh
+  chmod 755 /admin
+  chown root:root /admin
+
+  if ! grep admin /home/root/.rhosts ; then
+    echo "elbert.cnd.hp.com admin" >> /home/root/.rhosts
+  fi
+
+  if ! grep admin /admin/.rhosts ; then
+    echo "elbert.cnd.hp.com admin" >> /admin/.rhosts
+  fi
+
+fi
+
+
+echo "`hostname` now setup with standardized admin user account"
+exit 0
+
